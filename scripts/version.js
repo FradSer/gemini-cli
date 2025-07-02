@@ -74,7 +74,4 @@ run(
 // 8. Create the atomic commit with all changes.
 run(`git commit --no-edit -m "${commitMessage}"`);
 
-// 9. Create the git tag to match the commit.
-run(`git tag -a "v${newVersion}" -m "${commitMessage}"`);
-
-console.log(`Successfully committed and tagged v${newVersion}.`);
+console.log(`Successfully committed version bump v${newVersion}.`);
