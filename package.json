@@ -51,7 +51,6 @@
     "publish:release": "npm run prepare:package && npm run build:packages && npm run build:sandbox:fast && npm run publish:sandbox && npm run publish:npm",
     "prepublishOnly": "node scripts/check-versions.js && node scripts/prepublish.js",
     "release:version": "node scripts/version.js",
-    "push:release:tag": "git push && git push --follow-tags",
     "check:versions": "node scripts/check-versions.js",
     "publish:actions-release": "npm run prepare:package && npm run build:packages && npm run publish:npm"
   },
