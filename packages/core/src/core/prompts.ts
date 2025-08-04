@@ -18,34 +18,180 @@ import { WriteFileTool } from '../tools/write-file.js';
 import process from 'node:process';
 import { isGitRepository } from '../utils/gitUtils.js';
 import { MemoryTool, GEMINI_CONFIG_DIR } from '../tools/memoryTool.js';
+import { GenerateCommitMessageTool } from '../tools/generate-commit-message.js';
+
+interface SystemMdConfig {
+  enabled: boolean;
+  path: string;
+}
+
+/**
+ * Parses GEMINI_SYSTEM_MD environment variable to determine system prompt configuration
+ */
+function parseSystemMdConfig(): SystemMdConfig {
+  const systemMdVar = process.env.GEMINI_SYSTEM_MD;
+  const defaultPath = path.resolve(path.join(GEMINI_CONFIG_DIR, 'system.md'));
+  
+  if (!systemMdVar) {
+    return { enabled: false, path: defaultPath };
+  }
+
+  const normalizedVar = systemMdVar.toLowerCase();
+  const isDisabled = ['0', 'false'].includes(normalizedVar);
+  
+  if (isDisabled) {
+    return { enabled: false, path: defaultPath };
+  }
+
+  const isDefaultEnabled = ['1', 'true'].includes(normalizedVar);
+  const resolvedPath = isDefaultEnabled 
+    ? defaultPath 
+    : resolveHomePath(systemMdVar);
+
+  return { enabled: true, path: resolvedPath };
+}
+
+/**
+ * Resolves home directory paths (~/ and ~) to absolute paths
+ */
+function resolveHomePath(inputPath: string): string {
+  if (inputPath.startsWith('~/')) {
+    return path.resolve(path.join(os.homedir(), inputPath.slice(2)));
+  }
+  if (inputPath === '~') {
+    return path.resolve(os.homedir());
+  }
+  return path.resolve(inputPath);
+}
+
+/**
+ * Validates that the system prompt file exists
+ */
+function validateSystemMdFile(filePath: string): void {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`missing system prompt file '${filePath}'`);
+  }
+}
+
+/**
+ * Handles writing system prompt to file based on GEMINI_WRITE_SYSTEM_MD environment variable
+ */
+function handleSystemMdWrite(basePrompt: string, defaultSystemMdPath: string): void {
+  const writeSystemMdVar = process.env.GEMINI_WRITE_SYSTEM_MD;
+  
+  if (!writeSystemMdVar) {
+    return;
+  }
+
+  const normalizedVar = writeSystemMdVar.toLowerCase();
+  const isDisabled = ['0', 'false'].includes(normalizedVar);
+  
+  if (isDisabled) {
+    return;
+  }
+
+  const isDefaultPath = ['1', 'true'].includes(normalizedVar);
+  const targetPath = isDefaultPath 
+    ? defaultSystemMdPath 
+    : resolveHomePath(writeSystemMdVar);
+
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.writeFileSync(targetPath, basePrompt);
+}
+
+/**
+ * Generates sandbox-specific section of the system prompt based on environment variables
+ */
+function getSandboxSection(): string {
+  const isSandboxExec = process.env.SANDBOX === 'sandbox-exec';
+  const isGenericSandbox = !!process.env.SANDBOX;
+
+  if (isSandboxExec) {
+    return `
+# macOS Seatbelt
+You are running under macos seatbelt with limited access to files outside the project directory or system temp directory, and with limited access to host system resources such as ports. If you encounter failures that could be due to macOS Seatbelt (e.g. if a command fails with 'Operation not permitted' or similar error), as you report the error to the user, also explain why you think it could be due to macOS Seatbelt, and how the user may need to adjust their Seatbelt profile.
+`;
+  }
+
+  if (isGenericSandbox) {
+    return `
+# Sandbox
+You are running in a sandbox container with limited access to files outside the project directory or system temp directory, and with limited access to host system resources such as ports. If you encounter failures that could be due to sandboxing (e.g. if a command fails with 'Operation not permitted' or similar error), when you report the error to the user, also explain why you think it could be due to sandboxing, and how the user may need to adjust their sandbox configuration.
+`;
+  }
+
+  return `
+# Outside of Sandbox
+You are running outside of a sandbox container, directly on the user's system. For critical commands that are particularly likely to modify the user's system outside of the project directory or system temp directory, as you explain the command to the user (per the Explain Critical Commands rule above), also remind the user to consider enabling sandboxing.
+`;
+}
+
+/**
+ * Generates Git repository section with commit tool information
+ */
+function getGitRepositorySection(): string {
+  if (!isGitRepository(process.cwd())) {
+    return '';
+  }
+
+  return `
+# Git Repository  
+- The current working (project) directory is being managed by a git repository.
+
+## Interactive Commit Workflow
+- **MANDATORY**: When asked to commit changes or prepare a commit, you MUST use the '${GenerateCommitMessageTool.Name}' tool.
+- **Usage**: Simply call [tool_call: ${GenerateCommitMessageTool.Name}] without any parameters.
+- The tool provides a complete interactive workflow:
+  1. Automatically analyzes git status and staged changes
+  2. Generates conventional commit messages using AI
+  3. Presents interactive options to the user:
+     - **Proceed** - Use the generated commit message as-is
+     - **Edit** - Modify the commit message interactively
+     - **Regenerate** - Generate a different commit message
+     - **Cancel** - Cancel the commit operation
+  4. Handles the actual commit process based on user choice
+
+## Important Rules
+- **DO NOT** use manual shell commands (git status, git add, git commit, etc.) for commit operations unless the user specifically requests raw git commands.
+- **Always** use the interactive tool first - it handles staging, analysis, and commit in one workflow.
+- **Never** push changes to a remote repository without being asked explicitly by the user.
+
+## When to Use the Tool
+- User says "commit", "git commit", "make a commit", etc.
+- User asks to "commit changes", "commit these files", etc.
+- After completing work when suggesting to commit changes
+- Any request involving creating a git commit
+`;
+}
+
+/**
+ * Returns commit prompt text if in a Git repository
+ */
+function getCommitPromptText(): string {
+  return isGitRepository(process.cwd()) 
+    ? 'Would you like me to commit these changes using the interactive commit tool?' 
+    : '';
+}
+
+/**
+ * Appends user memory to the base prompt with proper formatting
+ */
+function appendUserMemory(basePrompt: string, userMemory?: string): string {
+  if (!userMemory?.trim()) {
+    return basePrompt;
+  }
+  
+  return `${basePrompt}\n\n---\n\n${userMemory.trim()}`;
+}
 
 export function getCoreSystemPrompt(userMemory?: string): string {
-  // if GEMINI_SYSTEM_MD is set (and not 0|false), override system prompt from file
-  // default path is .gemini/system.md but can be modified via custom path in GEMINI_SYSTEM_MD
-  let systemMdEnabled = false;
-  let systemMdPath = path.resolve(path.join(GEMINI_CONFIG_DIR, 'system.md'));
-  const systemMdVar = process.env.GEMINI_SYSTEM_MD;
-  if (systemMdVar) {
-    const systemMdVarLower = systemMdVar.toLowerCase();
-    if (!['0', 'false'].includes(systemMdVarLower)) {
-      systemMdEnabled = true; // enable system prompt override
-      if (!['1', 'true'].includes(systemMdVarLower)) {
-        let customPath = systemMdVar;
-        if (customPath.startsWith('~/')) {
-          customPath = path.join(os.homedir(), customPath.slice(2));
-        } else if (customPath === '~') {
-          customPath = os.homedir();
-        }
-        systemMdPath = path.resolve(customPath); // use custom path from GEMINI_SYSTEM_MD
-      }
-      // require file to exist when override is enabled
-      if (!fs.existsSync(systemMdPath)) {
-        throw new Error(`missing system prompt file '${systemMdPath}'`);
-      }
-    }
+  const systemMdConfig = parseSystemMdConfig();
+  
+  if (systemMdConfig.enabled) {
+    validateSystemMdFile(systemMdConfig.path);
   }
-  const basePrompt = systemMdEnabled
-    ? fs.readFileSync(systemMdPath, 'utf8')
+  const basePrompt = systemMdConfig.enabled
+    ? fs.readFileSync(systemMdConfig.path, 'utf8')
     : `
 You are an interactive CLI agent specializing in software engineering tasks. Your primary goal is to help users safely and efficiently, adhering strictly to the following instructions and utilizing your available tools.
 
@@ -119,50 +265,9 @@ When requested to perform tasks like fixing bugs, adding features, refactoring, 
 - **Help Command:** The user can use '/help' to display help information.
 - **Feedback:** To report a bug or provide feedback, please use the /bug command.
 
-${(function () {
-  // Determine sandbox status based on environment variables
-  const isSandboxExec = process.env.SANDBOX === 'sandbox-exec';
-  const isGenericSandbox = !!process.env.SANDBOX; // Check if SANDBOX is set to any non-empty value
+${getSandboxSection()}
 
-  if (isSandboxExec) {
-    return `
-# macOS Seatbelt
-You are running under macos seatbelt with limited access to files outside the project directory or system temp directory, and with limited access to host system resources such as ports. If you encounter failures that could be due to macOS Seatbelt (e.g. if a command fails with 'Operation not permitted' or similar error), as you report the error to the user, also explain why you think it could be due to macOS Seatbelt, and how the user may need to adjust their Seatbelt profile.
-`;
-  } else if (isGenericSandbox) {
-    return `
-# Sandbox
-You are running in a sandbox container with limited access to files outside the project directory or system temp directory, and with limited access to host system resources such as ports. If you encounter failures that could be due to sandboxing (e.g. if a command fails with 'Operation not permitted' or similar error), when you report the error to the user, also explain why you think it could be due to sandboxing, and how the user may need to adjust their sandbox configuration.
-`;
-  } else {
-    return `
-# Outside of Sandbox
-You are running outside of a sandbox container, directly on the user's system. For critical commands that are particularly likely to modify the user's system outside of the project directory or system temp directory, as you explain the command to the user (per the Explain Critical Commands rule above), also remind the user to consider enabling sandboxing.
-`;
-  }
-})()}
-
-${(function () {
-  if (isGitRepository(process.cwd())) {
-    return `
-# Git Repository
-- The current working (project) directory is being managed by a git repository.
-- When asked to commit changes or prepare a commit, always start by gathering information using shell commands:
-  - \`git status\` to ensure that all relevant files are tracked and staged, using \`git add ...\` as needed.
-  - \`git diff HEAD\` to review all changes (including unstaged changes) to tracked files in work tree since last commit.
-    - \`git diff --staged\` to review only staged changes when a partial commit makes sense or was requested by the user.
-  - \`git log -n 3\` to review recent commit messages and match their style (verbosity, formatting, signature line, etc.)
-- Combine shell commands whenever possible to save time/steps, e.g. \`git status && git diff HEAD && git log -n 3\`.
-- Always propose a draft commit message. Never just ask the user to give you the full commit message.
-- Prefer commit messages that are clear, concise, and focused more on "why" and less on "what".
-- Keep the user informed and ask for clarification or confirmation where needed.
-- After each commit, confirm that it was successful by running \`git status\`.
-- If a commit fails, never attempt to work around the issues without being asked to do so.
-- Never push changes to a remote repository without being asked explicitly by the user.
-`;
-  }
-  return '';
-})()}
+${getGitRepositorySection()}
 
 # Examples (Illustrating Tone and Workflow)
 <example>
@@ -212,17 +317,29 @@ Refactoring complete. Running verification...
 [tool_call: ${ShellTool.Name} for 'ruff check src/auth.py && pytest']
 (After verification passes)
 All checks passed. This is a stable checkpoint.
-${(function () {
-  if (isGitRepository(process.cwd())) {
-    return `Would you like me to write a commit message and commit these changes?`;
-  }
-  return '';
-})()}
+${getCommitPromptText()}
 </example>
 
 <example>
 user: Delete the temp directory.
 model: I can run \`rm -rf /path/to/project/temp\`. This will permanently delete the directory and all its contents.
+</example>
+
+<example>
+user: git commit these changes
+model: I'll use the interactive commit tool to analyze your changes and provide commit options.
+[tool_call: ${GenerateCommitMessageTool.Name}]
+</example>
+
+<example>
+user: commit the files I just modified
+model: [tool_call: ${GenerateCommitMessageTool.Name}]
+</example>
+
+<example>  
+user: make a commit with these changes
+model: I'll create a commit using the interactive workflow.
+[tool_call: ${GenerateCommitMessageTool.Name}]
 </example>
 
 <example>
@@ -265,34 +382,9 @@ To help you check their settings, I can read their contents. Which one would you
 Your core function is efficient and safe assistance. Balance extreme conciseness with the crucial need for clarity, especially regarding safety and potential system modifications. Always prioritize user control and project conventions. Never make assumptions about the contents of files; instead use '${ReadFileTool.Name}' or '${ReadManyFilesTool.Name}' to ensure you aren't making broad assumptions. Finally, you are an agent - please keep going until the user's query is completely resolved.
 `.trim();
 
-  // if GEMINI_WRITE_SYSTEM_MD is set (and not 0|false), write base system prompt to file
-  const writeSystemMdVar = process.env.GEMINI_WRITE_SYSTEM_MD;
-  if (writeSystemMdVar) {
-    const writeSystemMdVarLower = writeSystemMdVar.toLowerCase();
-    if (!['0', 'false'].includes(writeSystemMdVarLower)) {
-      if (['1', 'true'].includes(writeSystemMdVarLower)) {
-        fs.mkdirSync(path.dirname(systemMdPath), { recursive: true });
-        fs.writeFileSync(systemMdPath, basePrompt); // write to default path, can be modified via GEMINI_SYSTEM_MD
-      } else {
-        let customPath = writeSystemMdVar;
-        if (customPath.startsWith('~/')) {
-          customPath = path.join(os.homedir(), customPath.slice(2));
-        } else if (customPath === '~') {
-          customPath = os.homedir();
-        }
-        const resolvedPath = path.resolve(customPath);
-        fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-        fs.writeFileSync(resolvedPath, basePrompt); // write to custom path from GEMINI_WRITE_SYSTEM_MD
-      }
-    }
-  }
+  handleSystemMdWrite(basePrompt, systemMdConfig.path);
 
-  const memorySuffix =
-    userMemory && userMemory.trim().length > 0
-      ? `\n\n---\n\n${userMemory.trim()}`
-      : '';
-
-  return `${basePrompt}${memorySuffix}`;
+  return appendUserMemory(basePrompt, userMemory);
 }
 
 /**
